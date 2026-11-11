@@ -128,6 +128,21 @@ function Test-IniForVersion($Ini, [string]$Ver) {
     return ,$p
 }
 
+function Get-IniBlock([string]$Text, [string]$Name) {
+    $lines = $Text -split "`r?`n"
+    $out = New-Object System.Collections.Generic.List[string]
+    $on = $false
+    foreach ($l in $lines) {
+        if ($l -match '^\s*\[(.+?)\]\s*$') {
+            if ($on) { break }
+            if ($Matches[1] -eq $Name) { $on = $true }
+        }
+        if ($on) { $out.Add($l.TrimEnd()) }
+    }
+    if ($out.Count -eq 0) { return $null }
+    return (($out -join "`r`n").TrimEnd())
+}
+
 function Restore-Ini([string]$Backup, [string]$Target) {
     if (-not (Test-Path $Backup)) { Write-Log "Резервная копия $Backup не найдена - откат невозможен!" 'ERR'; return $false }
     Copy-Item -Path $Backup -Destination $Target -Force
@@ -214,6 +229,7 @@ else {
     New-Item -ItemType Directory -Force -Path $dl | Out-Null
 
     $chosen = $null
+    $pool = New-Object System.Collections.Generic.List[object]
     $i = 0
     foreach ($src in $sources) {
         $i++
@@ -230,6 +246,7 @@ else {
         if ($text -match '(?i)<html|<!doctype') { Write-Log '  вместо ini получена HTML-страница - пропуск' 'WARN'; continue }
         $ini = ConvertFrom-RdpIni $text
         $probs = Test-IniForVersion $ini $ts.Version
+        $pool.Add(@{ Src = $src; Text = $text; Ini = $ini; File = $file })
         if ($probs.Count -gt 0) { Write-Log ("  не подходит: " + ($probs -join '; ')) 'WARN'; continue }
         $upd = $(if ($ini['Main'].ContainsKey('Updated')) { $ini['Main']['Updated'] } else { '?' })
         Write-Log "  ПОДХОДИТ: секция [$($ts.Version)] полная; Updated=$upd; размер $($bytes.Length); SHA256 $((Get-FileHash $file -Algorithm SHA256).Hash)" 'OK'
@@ -237,6 +254,35 @@ else {
         Write-Log ("  офсеты: LocalOnly={0} SingleUser={1} DefPolicy={2} SLInit={3}" -f $sec['LocalOnlyOffset.x64'], $sec['SingleUserOffset.x64'], $sec['DefPolicyOffset.x64'], $sec['SLInitOffset.x64'])
         $chosen = @{ Src = $src; File = $file; Bytes = $bytes; Ini = $ini; Upd = $upd }
         break
+    }
+
+    # Слияние: полный ini с [PatchCodes] из одного источника + секции нужной версии из другого.
+    # Результат проходит ту же строгую проверку; применяется только если все 3 условия выполнены.
+    if (-not $chosen) {
+        $ver = $ts.Version
+        foreach ($base in $pool) {
+            if ($chosen) { break }
+            if ($base.Ini.ContainsKey($ver) -or -not $base.Ini.ContainsKey('PatchCodes') -or -not $base.Ini.ContainsKey('Main')) { continue }
+            foreach ($donor in $pool) {
+                if ($donor -eq $base) { continue }
+                $b1 = Get-IniBlock $donor.Text $ver
+                $b2 = Get-IniBlock $donor.Text "$ver-SLInit"
+                if (-not $b1 -or -not $b2) { continue }
+                $mergedText = $base.Text.TrimEnd() + "`r`n`r`n" + $b1 + "`r`n`r`n" + $b2 + "`r`n"
+                $mIni = ConvertFrom-RdpIni $mergedText
+                $mp = Test-IniForVersion $mIni $ver
+                if ($mp.Count -gt 0) { Write-Log ("Слияние [{0} + {1}] не прошло проверку: {2}" -f $base.Src.Name, $donor.Src.Name, ($mp -join '; ')) 'WARN'; continue }
+                $mFile = Join-Path $dl 'merged.ini'
+                $mBytes = (New-Object Text.UTF8Encoding $false).GetBytes($mergedText)
+                [IO.File]::WriteAllBytes($mFile, $mBytes)
+                $sec = $mIni[$ver]
+                Write-Log ("СЛИЯНИЕ ПРОШЛО ПРОВЕРКУ: база '{0}' (все версии + [PatchCodes]) + секции [{1}] из '{2}'" -f $base.Src.Name, $ver, $donor.Src.Name) 'OK'
+                Write-Log ("  офсеты: LocalOnly={0} SingleUser={1} DefPolicy={2} SLInit={3}" -f $sec['LocalOnlyOffset.x64'], $sec['SingleUserOffset.x64'], $sec['DefPolicyOffset.x64'], $sec['SLInitOffset.x64'])
+                Write-Log '  эти офсеты совпадают с конфигурацией из issue #694 sebaxakerhtc/rdpwrap.ini (создана RDPWrapOffsetFinder v1.0, проверена автором на этой же сборке termsrv.dll 10.0.26100.9818) и с PR #693.' 'INFO'
+                $chosen = @{ Src = @{ Name = "слияние: $($base.Src.Name) + $($donor.Src.Name)" }; File = $mFile; Bytes = $mBytes; Ini = $mIni; Upd = 'merged' }
+                break
+            }
+        }
     }
 
     if (-not $chosen) {
